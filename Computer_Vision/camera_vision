@@ -1,0 +1,612 @@
+"""
+camera_vision.py - camera version of vision.py (same function names, same data formats)
+
+How to use it with the bot / main.py (updated for the V3 files: main.py, bot.py, garbage.py, pieces.py)
+--------------------------------------------------------------------------------------------------
+1. Put this file next to main.py and bot.py.
+2. In main.py change      import vision      to      import camera_vision as vision
+3. In main.py, right after   mode_name = choose_mode()   add   vision.setup(garbage=GARBAGE_MODE)
+   (click the 4 board corners, then the 4 NEXT-panel corners, then press 'b' while the board is EMPTY).
+   garbage.py / bot.py need no changes: garbage.install() sees  _garbage_installed  below and does nothing,
+   because this file labels gray garbage cells itself.
+4. Turn the ghost piece OFF in tetr.io's settings.
+
+Formats (identical to vision.py):
+    get_board_state()   20 x 10 list of strings: "EMPTY", "X" (a locked cell, piece type unknown) or "GARBAGE"
+                        (multiplayer only). The falling piece is NOT included.
+    get_next_queue()    5 piece letters read from the NEXT panel ("EMPTY" for a slot that could not be read);
+                        [] if the NEXT panel was skipped during setup.
+    get_active_piece()  {"piece_type", "col", "is_moving", "grid"}
+    detect_spawn()      the piece letter once per new piece, otherwise None
+"""
+import sys
+import threading
+import time
+from collections import deque
+
+import cv2
+import numpy as np
+
+# ---------- SETTINGS ----------
+CAMERA_BACKEND = "opencv"      # "opencv" = USB webcam (Brio, any UVC camera); "picamera2" = Raspberry Pi Camera Module 3
+CAMERA_INDEX = 0               # which USB camera (the laptop's own camera is usually 0 - try 1 if you get the wrong picture)
+REQUEST_WIDTH, REQUEST_HEIGHT, REQUEST_FPS = 1280, 720, 30
+MANUAL_EXPOSURE_VALUE = -6     # the Brio may ignore this
+PICAMERA_CONTROLS = {}         # Pi camera only, e.g. {"AfMode": 0, "LensPosition": 1.0} for fixed focus. Start empty.
+
+COLS = 10
+BOARD_ROWS = 20
+ABOVE_ROWS = 2     # extra rows ABOVE the board to read too (the spawn area). Needs room above the board in the
+                   # camera frame. 0 = old behaviour (board only). Up to 4 if the frame allows.
+CELL = 30          # pixels per cell in the warped image
+ZONE_EXTRA = 4     # spawn zone = the ABOVE rows plus this many board rows
+
+DIFF_THRESHOLD = 65
+STABILITY_FRAMES = 2   # loop iterations a cell must read "filled" before it is trusted
+CONFIRM_FRAMES = 3     # loop iterations the same piece must be seen before it is reported
+CLEAR_FRAMES = 2       # loop iterations with no clean piece before the same letter can be reported again
+
+# NEXT panel: you click the 4 corners of the black area under the word NEXT. It is flattened to 5 slots x 3 cells high.
+NEXT_SLOTS = 5
+NEXT_SLOT_CELLS = 3
+NEXT_COLS = 5
+NEXT_SAT_MIN = 90          # a pixel belongs to a piece if it is colourful (the white frame is not) ...
+NEXT_VAL_MIN = 70          # ... and bright enough
+NEXT_EDGE_MARGIN = 8       # ignore this many pixels at the panel edge (a click slightly off pulls the frame in)
+NEXT_CONFIRM_FRAMES = 2    # the same queue must be read this many frames in a row before it is trusted
+SPAWN_QUEUE_WAIT = 12      # a new piece is held back (at most this many loop passes) until the NEXT panel has shifted,
+                           # so the bot never gets a stale lookahead
+
+# Garbage bricks (multiplayer): gray = R, G, B nearly equal. Same limits as garbage.py.
+GARBAGE_LABEL = "GARBAGE"
+GRAY_MAX_SPREAD = 30       # max(R,G,B) - min(R,G,B) at or below this counts as gray
+GRAY_MIN_BRIGHT = 55       # below this is empty / ghost centre
+GRAY_MAX_BRIGHT = 200      # above this is a highlight
+MIN_GARBAGE_PER_ROW = 7    # a row is a garbage row only if this many cells are gray
+MAX_GARBAGE_ROWS = 12      # more than this = a gray overlay, ignore
+
+SHOW_OVERLAY = True    # do not click on the overlay window while the bot is playing
+
+EMPTY = "EMPTY"
+FILLED = "X"
+
+# garbage.install(vision) checks this flag and then does nothing: this file already labels garbage itself
+_garbage_installed = True
+
+# ---------- SHAPE LIBRARY (verified on the live camera for all 7 pieces) ----------
+BASE_SHAPES = {
+    'I': {(0, 0), (0, 1), (0, 2), (0, 3)},
+    'O': {(0, 0), (0, 1), (1, 0), (1, 1)},
+    'T': {(0, 1), (1, 0), (1, 1), (1, 2)},
+    'S': {(0, 1), (0, 2), (1, 0), (1, 1)},
+    'Z': {(0, 0), (0, 1), (1, 1), (1, 2)},
+    'J': {(0, 0), (1, 0), (1, 1), (1, 2)},
+    'L': {(0, 2), (1, 0), (1, 1), (1, 2)},
+}
+
+
+def normalize_shape(cells):
+    min_row = min(r for r, c in cells)
+    min_col = min(c for r, c in cells)
+    return frozenset((r - min_row, c - min_col) for r, c in cells)
+
+
+def _rotate_90(cells):
+    return normalize_shape([(c, -r) for r, c in cells])
+
+
+def all_rotations(cells):
+    shape = normalize_shape(cells)
+    found = []
+    for _ in range(4):
+        if shape not in found:
+            found.append(shape)
+        shape = _rotate_90(shape)
+    return found
+
+
+TETROMINO_SHAPES = {name: all_rotations(cells) for name, cells in BASE_SHAPES.items()}
+
+
+def identify_piece(cells):
+    shape = normalize_shape(cells)
+    for name, orientations in TETROMINO_SHAPES.items():
+        if shape in orientations:
+            return name
+    return None
+
+
+def find_connected_group(cells):
+    """Largest orthogonally connected group of cells, returned only if it has exactly 4."""
+    cell_set = set(cells)
+    visited = set()
+    best = []
+    for start in cells:
+        if start in visited:
+            continue
+        group = []
+        queue = deque([start])
+        seen = {start}
+        while queue:
+            r, c = queue.popleft()
+            group.append((r, c))
+            for dr, dc in ((-1, 0), (1, 0), (0, -1), (0, 1)):
+                n = (r + dr, c + dc)
+                if n in cell_set and n not in seen:
+                    seen.add(n)
+                    queue.append(n)
+        visited |= seen
+        if len(group) > len(best):
+            best = group
+    return best if len(best) == 4 else None
+
+
+# ---------- NEXT PANEL ----------
+def read_queue(panel):
+    """panel = the flattened NEXT panel (NEXT_COLS*CELL wide, NEXT_SLOTS*NEXT_SLOT_CELLS*CELL tall).
+    Returns 5 letters; "EMPTY" for a slot that cannot be read.
+    Each slot is cut out, the coloured pixels are found, their bounding box divided by the cell size gives the shape
+    (pieces are NOT on a fixed grid: I and O sit half a cell off the others), and the shape goes through the same
+    library as the falling piece."""
+    hsv = cv2.cvtColor(panel, cv2.COLOR_BGR2HSV)       # pieces are saturated colours; the white panel frame is not
+    mask = ((hsv[:, :, 1] > NEXT_SAT_MIN) & (hsv[:, :, 2] > NEXT_VAL_MIN)).astype(np.uint8)
+    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, np.ones((3, 3), np.uint8))   # drop thin edge slivers
+    m = NEXT_EDGE_MARGIN
+    mask[:m, :] = 0
+    mask[-m:, :] = 0
+    mask[:, :m] = 0
+    mask[:, -m:] = 0
+    slot_h = NEXT_SLOT_CELLS * CELL
+    out = []
+    for i in range(NEXT_SLOTS):
+        band = mask[i * slot_h:(i + 1) * slot_h]
+        ys, xs = np.nonzero(band)
+        if len(xs) < 20:
+            out.append(EMPTY)
+            continue
+        x0, x1, y0, y1 = xs.min(), xs.max() + 1, ys.min(), ys.max() + 1
+        ncols, nrows = round((x1 - x0) / CELL), round((y1 - y0) / CELL)
+        cells = set()
+        for r in range(nrows):
+            for c in range(ncols):
+                patch = band[y0 + r * CELL:y0 + (r + 1) * CELL, x0 + c * CELL:x0 + (c + 1) * CELL]
+                if patch.size and patch.mean() > 0.5:
+                    cells.add((r, c))
+        label = identify_piece(cells) if len(cells) == 4 else None
+        out.append(label or EMPTY)
+    return out
+
+
+# ---------- PIPELINE (everything except the camera itself) ----------
+class Pipeline:
+    def __init__(self, above_rows=ABOVE_ROWS, garbage=False):
+        self.above = above_rows
+        self.garbage_on = garbage
+        self.total_rows = BOARD_ROWS + above_rows
+        self.zone_rows = above_rows + ZONE_EXTRA
+        self.width = COLS * CELL
+        self.height = self.total_rows * CELL
+        self.matrix = None
+        self.baseline = None
+        self.counter = np.zeros((self.total_rows, COLS), dtype=int)
+        self.stable = np.zeros((self.total_rows, COLS), dtype=int)
+        self.group = None
+        self.board = [[EMPTY] * COLS for _ in range(BOARD_ROWS)]
+        self.zone_grid = [[EMPTY] * COLS for _ in range(self.zone_rows)]
+        self.piece_type = None
+        self.last_reported = None
+        self.candidate = None
+        self.candidate_streak = 0
+        self.none_streak = 0
+        self.pending_spawn = None
+        # NEXT panel
+        self.next_matrix = None
+        self.next_queue = []
+        self.next_cand = None
+        self.next_streak = 0
+        self.queue_at_spawn = []
+        self.spawn_wait = 0
+
+    # -- geometry --
+    def set_corners(self, points):
+        """points = the 4 BOARD corners as clicked: top-left, top-right, bottom-left, bottom-right.
+        The warp is extended upward by ABOVE_ROWS so the spawn area is read too."""
+        top = self.above * CELL
+        bottom = top + BOARD_ROWS * CELL
+        src = np.float32(points)
+        dst = np.float32([[0, top], [self.width, top], [0, bottom], [self.width, bottom]])
+        self.matrix = cv2.getPerspectiveTransform(src, dst)
+
+    def set_next_corners(self, points):
+        """points = the 4 corners of the black NEXT area (under the word NEXT): top-left, top-right, bottom-left, bottom-right."""
+        w, h = NEXT_COLS * CELL, NEXT_SLOTS * NEXT_SLOT_CELLS * CELL
+        self.next_matrix = cv2.getPerspectiveTransform(np.float32(points),
+                                                       np.float32([[0, 0], [w, 0], [0, h], [w, h]]))
+
+    def warp(self, frame):
+        return cv2.warpPerspective(frame, self.matrix, (self.width, self.height))
+
+    def warp_next(self, frame):
+        return cv2.warpPerspective(frame, self.next_matrix, (NEXT_COLS * CELL, NEXT_SLOTS * NEXT_SLOT_CELLS * CELL))
+
+    # -- grid extraction (same method as piece_tracking_v4: centre of each cell vs. empty baseline) --
+    def cell_averages(self, warped):
+        pad = CELL // 4
+        cells = warped.reshape(self.total_rows, CELL, COLS, CELL, 3)
+        inner = cells[:, pad:CELL - pad, :, pad:CELL - pad, :].astype(float)
+        return inner.mean(axis=(1, 3))
+
+    def set_baseline(self, warped):
+        self.baseline = self.cell_averages(warped)
+        self.counter[:] = 0
+        self.last_reported = None
+        self.candidate = None
+        self.candidate_streak = 0
+        self.none_streak = 0
+        self.pending_spawn = None
+        self.queue_at_spawn = []
+        self.spawn_wait = 0
+
+    def raw_from_averages(self, avgs):
+        if self.baseline is None:
+            return np.zeros((self.total_rows, COLS), dtype=int)
+        diff = np.linalg.norm(avgs - self.baseline, axis=2)
+        return (diff > DIFF_THRESHOLD).astype(int)
+
+    def raw_grid(self, warped):
+        return self.raw_from_averages(self.cell_averages(warped))
+
+    # -- per-frame processing --
+    def process_frame(self, frame):
+        warped = self.warp(frame)
+        avgs = self.cell_averages(warped)
+        self.process_raw(self.raw_from_averages(avgs), avgs)
+        if self.next_matrix is not None:
+            self.update_next(read_queue(self.warp_next(frame)))
+        return warped
+
+    def update_next(self, reading):
+        """Accepts a queue reading once the same reading has been seen NEXT_CONFIRM_FRAMES times in a row."""
+        if reading == self.next_cand:
+            self.next_streak += 1
+        else:
+            self.next_cand = reading
+            self.next_streak = 1
+        if self.next_streak >= NEXT_CONFIRM_FRAMES and any(p != EMPTY for p in reading):
+            self.next_queue = list(reading)
+
+    def process_raw(self, raw, colors=None):
+        self.counter = np.where(raw == 1, self.counter + 1, 0)
+        stable = (self.counter >= STABILITY_FRAMES).astype(int)
+        self.stable = stable
+
+        zone_cells = [(r, c) for r in range(self.zone_rows) for c in range(COLS) if stable[r][c]]
+        self.group = find_connected_group(zone_cells)
+
+        self.zone_grid = [[FILLED if stable[r][c] else EMPTY for c in range(COLS)]
+                          for r in range(self.zone_rows)]
+
+        board = stable.copy()
+        if self.group:
+            for r, c in self.group:        # the falling piece is not part of the locked board
+                board[r][c] = 0
+        self.board = [[FILLED if v else EMPTY for v in row] for row in board[self.above:]]
+        if self.garbage_on and colors is not None:
+            self._label_garbage(colors)
+
+        self._detect()
+
+    def _label_garbage(self, colors):
+        """Locked cells that are gray become "GARBAGE" (only rows with at least MIN_GARBAGE_PER_ROW gray cells count)."""
+        per_row = {}
+        for r in range(BOARD_ROWS):
+            for c in range(COLS):
+                if self.board[r][c] != FILLED:
+                    continue
+                b, g, rr = colors[self.above + r][c]
+                spread = max(b, g, rr) - min(b, g, rr)
+                bright = (b + g + rr) / 3
+                if spread <= GRAY_MAX_SPREAD and GRAY_MIN_BRIGHT <= bright <= GRAY_MAX_BRIGHT:
+                    per_row.setdefault(r, []).append(c)
+        rows = [r for r, cols in per_row.items() if len(cols) >= MIN_GARBAGE_PER_ROW]
+        if len(rows) > MAX_GARBAGE_ROWS:       # a gray overlay / loading screen, not garbage
+            return
+        for r in rows:
+            for c in per_row[r]:
+                self.board[r][c] = GARBAGE_LABEL
+
+    def _detect(self):
+        if self.group is None:
+            self.piece_type = None
+            self.candidate = None
+            self.candidate_streak = 0
+            self.none_streak += 1
+            if self.none_streak >= CLEAR_FRAMES:
+                self.last_reported = None
+            return
+
+        self.none_streak = 0
+        label = identify_piece(self.group) or "UNKNOWN"
+        self.piece_type = None if label == "UNKNOWN" else label
+
+        if label == self.candidate:
+            self.candidate_streak += 1
+        else:
+            self.candidate = label
+            self.candidate_streak = 1
+
+        if self.candidate_streak >= CONFIRM_FRAMES and label != self.last_reported:
+            self.last_reported = label
+            if label != "UNKNOWN":
+                self.pending_spawn = label
+
+    def queue_is_stale(self, piece):
+        """True if the NEXT panel still shows the queue from BEFORE `piece` spawned (the panel shifts up by one when a
+        piece spawns, so the camera can lag a few frames behind). Fresh queue = last spawn's queue moved up one slot."""
+        q = self.next_queue
+        if not q:
+            return False
+        before = self.queue_at_spawn
+        if before and before[0] == piece:        # the queue recorded at the last spawn starts with this piece: usable
+            compared = 0
+            for new, old in zip(q[:-1], before[1:]):
+                if new == EMPTY or old == EMPTY:
+                    continue
+                compared += 1
+                if new != old:
+                    return True                  # not moved up yet
+            return False                         # moved up (or too little readable to tell)
+        return q[0] == piece                     # no usable record: a fresh queue starts with the piece AFTER this one
+
+    def draw_overlay(self, warped):
+        img = warped.copy()
+        for r in range(self.total_rows):
+            for c in range(COLS):
+                x, y = c * CELL, r * CELL
+                cv2.rectangle(img, (x, y), (x + CELL, y + CELL), (80, 80, 80), 1)
+                if self.stable[r][c]:
+                    cv2.rectangle(img, (x + 2, y + 2), (x + CELL - 2, y + CELL - 2), (0, 255, 0), 2)
+        if self.group:                      # red = what is treated as the falling piece
+            for r, c in self.group:
+                cv2.rectangle(img, (c * CELL + 2, r * CELL + 2),
+                              (c * CELL + CELL - 2, r * CELL + CELL - 2), (0, 0, 255), 2)
+        cv2.line(img, (0, self.zone_rows * CELL), (self.width, self.zone_rows * CELL), (255, 0, 0), 1)
+        if self.above:
+            cv2.line(img, (0, self.above * CELL), (self.width, self.above * CELL), (255, 0, 255), 1)
+        if self.last_reported:
+            cv2.putText(img, f"piece: {self.last_reported}", (5, 15),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 1)
+        if self.next_queue:
+            cv2.putText(img, "next: " + " ".join(p if p != EMPTY else "?" for p in self.next_queue), (5, 32),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 255, 255), 1)
+        return img
+
+
+# ---------- CAMERA (the only part that needs real hardware) ----------
+class _CvCamera:
+    """Any USB webcam through OpenCV (Windows: DirectShow, Linux/Raspberry Pi: V4L2)."""
+
+    def __init__(self):
+        if sys.platform.startswith("win"):
+            api = cv2.CAP_DSHOW
+        elif sys.platform.startswith("linux"):
+            api = cv2.CAP_V4L2
+        else:
+            api = cv2.CAP_ANY
+        self.cap = cv2.VideoCapture(CAMERA_INDEX, api)
+        self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, REQUEST_WIDTH)
+        self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, REQUEST_HEIGHT)
+        self.cap.set(cv2.CAP_PROP_FPS, REQUEST_FPS)
+        for prop, value in ((cv2.CAP_PROP_AUTOFOCUS, 0), (cv2.CAP_PROP_AUTO_EXPOSURE, 0.25),
+                            (cv2.CAP_PROP_EXPOSURE, MANUAL_EXPOSURE_VALUE), (cv2.CAP_PROP_AUTO_WB, 0)):
+            self.cap.set(prop, value)
+
+    def read(self):
+        return self.cap.read()
+
+    def release(self):
+        self.cap.release()
+
+
+class _PiCamera:
+    """Raspberry Pi Camera Module (Picamera2). NOT yet tested on real hardware.
+    Picamera2's "RGB888" format gives a numpy array in B,G,R order, which is what OpenCV expects."""
+
+    def __init__(self):
+        from picamera2 import Picamera2
+        self.cam = Picamera2()
+        config = self.cam.create_video_configuration(
+            main={"size": (REQUEST_WIDTH, REQUEST_HEIGHT), "format": "RGB888"},
+            controls={"FrameRate": REQUEST_FPS})
+        self.cam.configure(config)
+        if PICAMERA_CONTROLS:
+            self.cam.set_controls(PICAMERA_CONTROLS)
+        self.cam.start()
+
+    def read(self):
+        return True, self.cam.capture_array()
+
+    def release(self):
+        self.cam.stop()
+        self.cam.close()
+
+
+def _open_camera():
+    return _PiCamera() if CAMERA_BACKEND == "picamera2" else _CvCamera()
+
+
+_pipe = None
+_cap = None
+_thread = None
+_running = False
+_lock = threading.Lock()
+_frame = None
+_frame_id = 0
+_last_processed_id = -1
+quit_requested = False
+
+
+def _grab_loop():
+    """Keeps only the newest frame, so the bot never works on stale (buffered) images."""
+    global _frame, _frame_id
+    while _running:
+        ok, f = _cap.read()
+        if not ok:
+            time.sleep(0.01)
+            continue
+        with _lock:
+            _frame = f
+            _frame_id += 1
+
+
+def _latest_frame(timeout=3.0):
+    t0 = time.time()
+    while True:
+        with _lock:
+            if _frame is not None:
+                return _frame.copy(), _frame_id
+        if time.time() - t0 > timeout:
+            raise RuntimeError("No frames from the camera - check CAMERA_INDEX / CAMERA_BACKEND.")
+        time.sleep(0.01)
+
+
+def _click_corners(window, count=4):
+    """Shows the live camera picture in `window` until `count` points are clicked. Returns the points,
+    or None if 's' (skip) was pressed. 'q' quits."""
+    points = []
+
+    def on_click(event, x, y, flags, param):
+        if event == cv2.EVENT_LBUTTONDOWN and len(points) < count:
+            points.append((x, y))
+            print(f"Point {len(points)}: ({x}, {y})")
+
+    cv2.namedWindow(window)
+    cv2.setMouseCallback(window, on_click)
+    while len(points) < count:
+        frame, _ = _latest_frame()
+        for p in points:
+            cv2.circle(frame, p, 5, (0, 0, 255), -1)
+        cv2.imshow(window, frame)
+        key = cv2.waitKey(1) & 0xFF
+        if key == ord('q'):
+            shutdown()
+            raise SystemExit
+        if key == ord('s'):
+            cv2.destroyWindow(window)
+            return None
+    cv2.destroyWindow(window)
+    return points
+
+
+def setup(garbage=False, next_panel=True):
+    """Call once before the main loop: open camera, click the 4 board corners, click the 4 NEXT-panel corners,
+    capture the empty baseline.  garbage=True (multiplayer) labels gray garbage bricks "GARBAGE"."""
+    global _pipe, _cap, _thread, _running
+    _pipe = Pipeline(ABOVE_ROWS, garbage=garbage)
+    _cap = _open_camera()
+    _running = True
+    _thread = threading.Thread(target=_grab_loop, daemon=True)
+    _thread.start()
+
+    print("Click the 4 corners of the BOARD (the 10x20 area): top-left, top-right, bottom-left, bottom-right")
+    _pipe.set_corners(_click_corners("Calibration - BOARD"))
+
+    if next_panel:
+        print("Now click the 4 corners of the black area under the word NEXT: "
+              "top-left, top-right, bottom-left, bottom-right   (press 's' to skip the NEXT panel)")
+        pts = _click_corners("Calibration - NEXT panel")
+        if pts:
+            _pipe.set_next_corners(pts)
+
+    print("Make sure the board is EMPTY (no falling piece, ghost piece off), then press 'b' in the window.")
+    while True:
+        frame, _ = _latest_frame()
+        warped = _pipe.warp(frame)
+        cv2.imshow("Baseline", warped)
+        key = cv2.waitKey(1) & 0xFF
+        if key == ord('b'):
+            _pipe.set_baseline(warped)
+            break
+        if key == ord('q'):
+            shutdown()
+            raise SystemExit
+    cv2.destroyAllWindows()
+    print("camera_vision ready.")
+
+
+def shutdown():
+    global _running
+    _running = False
+    if _cap is not None:
+        _cap.release()
+    cv2.destroyAllWindows()
+
+
+# ---------- same API as vision.py ----------
+def capture_monitor():
+    """Takes the newest camera frame and processes it. Returns the frame (ignored by the other calls)."""
+    global _last_processed_id, quit_requested
+    frame, fid = _latest_frame()
+    if fid != _last_processed_id:          # never count the same camera frame twice
+        warped = _pipe.process_frame(frame)
+        _last_processed_id = fid
+        if SHOW_OVERLAY:
+            cv2.imshow("camera_vision", _pipe.draw_overlay(warped))
+            if cv2.waitKey(1) & 0xFF == ord('q'):
+                quit_requested = True
+    return frame
+
+
+def get_board_state(full_img=None):
+    return [row[:] for row in _pipe.board]
+
+
+def get_next_queue(full_img=None, max_retries=3, retry_delay=0.02):
+    return list(_pipe.next_queue)      # [] when the NEXT panel was skipped or not read yet
+
+
+def get_active_piece(previous_spawn_grid=None, full_img=None):
+    grid = [row[:] for row in _pipe.zone_grid]
+    if _pipe.group is None or _pipe.piece_type is None:
+        return {"piece_type": None, "col": None, "is_moving": False, "grid": grid}
+    left_col = min(c for r, c in _pipe.group)
+    is_moving = previous_spawn_grid is not None and previous_spawn_grid != grid
+    return {"piece_type": _pipe.piece_type, "col": left_col, "is_moving": is_moving, "grid": grid}
+
+
+def detect_spawn(previous_queue=None, current_queue=None):
+    """Returns the new piece's letter once, then None until the next piece appears.
+    The report is held back (a few loop passes at most) until the NEXT panel has shifted up, so that the
+    queue the bot receives together with the new piece is already the up-to-date one."""
+    p = _pipe
+    if p.pending_spawn is None:
+        return None
+    if p.next_matrix is not None and p.spawn_wait < SPAWN_QUEUE_WAIT and p.queue_is_stale(p.pending_spawn):
+        p.spawn_wait += 1
+        return None
+    spawned = p.pending_spawn
+    p.pending_spawn = None
+    p.spawn_wait = 0
+    p.queue_at_spawn = list(p.next_queue)
+    return spawned
+
+
+# ---------- run this file directly to test piece detection (no bot, no keys) ----------
+if __name__ == "__main__":
+    print("camera_vision test - piece detection only.")
+    setup()
+    print("Drop pieces. Each new piece is printed below. Press 'q' in the overlay window to quit.\n")
+    seen = []
+    try:
+        while not quit_requested:
+            capture_monitor()
+            piece = detect_spawn()
+            if piece:
+                seen.append(piece)
+                print(f"piece #{len(seen)}: {piece}    next: {get_next_queue()}")
+            time.sleep(0.02)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        shutdown()
+        print(f"\nDetected {len(seen)} pieces: {' '.join(seen)}")
