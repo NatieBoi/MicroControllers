@@ -1,0 +1,395 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="theme-color" content="#0e0a18">
+<title>Tetris Robot</title>
+<style>
+:root{--bg:#0e0a18;--card:#161026;--line:#2b3052;--text:#ece9f6;--mute:#8e8aab;--acc:#a259ff;--acc2:#7cc4ff;--bad:#f87171}
+*{box-sizing:border-box;-webkit-tap-highlight-color:transparent}
+body{margin:0;background:var(--bg);color:var(--text);font:16px/1.4 system-ui,sans-serif;padding:12px 16px calc(24px + env(safe-area-inset-bottom))}
+h1{font-size:18px;margin:4px 0 12px;display:flex;justify-content:space-between;align-items:center}
+.pill{font-size:12px;padding:3px 10px;border-radius:99px;background:var(--line);color:var(--mute)}
+.pill.on{background:#3b1d6e;color:#d6b8ff}
+.card{background:rgba(22,16,38,.9);border:1px solid var(--line);border-radius:14px;padding:12px;margin-bottom:12px}
+.card h2{font-size:13px;letter-spacing:.06em;text-transform:uppercase;color:var(--mute);margin:0 0 10px;font-weight:600}
+#view{position:relative;width:100%;border-radius:10px;overflow:hidden;background:#000;touch-action:manipulation}
+#view img{width:100%;display:block}
+.dot{position:absolute;width:16px;height:16px;margin:-8px 0 0 -8px;border-radius:50%;border:2px solid #fff;pointer-events:none}
+.row{display:flex;gap:8px;align-items:center;margin-top:10px}
+.row>*{flex:1}
+button{font:inherit;border:0;border-radius:10px;padding:12px;background:var(--line);color:var(--text);min-height:44px}
+button.sel{background:var(--acc);color:#fff;font-weight:600}
+#go{width:100%;font-size:20px;font-weight:700;min-height:64px;background:var(--acc);color:#fff}
+#go.stop{background:var(--bad);color:#2a0606}
+label{display:block;font-size:13px;color:var(--mute);margin:12px 0 6px}
+input[type=range]{width:100%;-webkit-appearance:none;appearance:none;background:transparent;height:34px;margin:0}
+input[type=range]::-webkit-slider-runnable-track{height:8px;border-radius:99px;background:var(--line)}
+input[type=range]::-moz-range-track{height:8px;border-radius:99px;background:var(--line)}
+input[type=range]::-webkit-slider-thumb{-webkit-appearance:none;width:28px;height:28px;margin-top:-10px;border-radius:50%;background:var(--acc);border:3px solid #fff}
+input[type=range]::-moz-range-thumb{width:22px;height:22px;border-radius:50%;background:var(--acc);border:3px solid #fff}
+input[type=number]{width:100%;font:inherit;padding:10px;border-radius:10px;border:1px solid var(--line);background:var(--bg);color:var(--text)}
+.hint{font-size:13px;color:var(--mute);margin-top:8px}
+pre{margin:0;max-height:220px;overflow:auto;font-size:12px;line-height:1.35;white-space:pre-wrap;word-break:break-word;color:#b8bfcf}
+.stat{display:flex;gap:8px}.stat div{flex:1;background:var(--bg);border-radius:10px;padding:8px;text-align:center}
+.stat b{display:block;font-size:22px}.stat span{font-size:11px;color:var(--mute);text-transform:uppercase}
+#err{color:var(--bad);font-size:14px;margin-top:8px;min-height:1em}
+.hidden{display:none}
+#wait{position:fixed;inset:0;z-index:50;background:var(--bg);display:flex;align-items:center;justify-content:center;gap:18px;padding:24px 18px;font-size:17px}
+#wait .wtext{flex:1 1 50%;text-align:left}
+#wait .wview{flex:0 1 46%;text-align:center}
+#wait .wview img{width:100%;max-height:60vh;object-fit:contain;border-radius:8px;display:none}
+#wait .wview img.on{display:block}
+#wait.hidden{display:none}
+#wait b{font-size:24px;color:var(--acc);display:block;margin-bottom:10px}
+#view.cal{touch-action:none;cursor:crosshair}
+#loupe{position:absolute;width:112px;height:112px;border-radius:50%;border:3px solid var(--acc);box-shadow:0 4px 18px #000b;background-color:#000;background-repeat:no-repeat;pointer-events:none;display:none;z-index:5;overflow:hidden}
+#loupe.next{border-color:var(--acc2)}
+#loupe.next:after{background:var(--acc2)}
+#loupe:after{content:"";position:absolute;left:50%;top:50%;width:10px;height:10px;margin:-5px;border-radius:50%;border:2px solid #fff;background:var(--acc);box-shadow:0 0 0 1px #000}
+#view{user-select:none;-webkit-user-select:none;-webkit-touch-callout:none}
+.rect{position:absolute;border:2px solid;pointer-events:none}
+
+#bg{position:fixed;inset:0;width:100%;height:100%;z-index:-1;pointer-events:none}
+.tabs{display:flex;gap:6px;margin-bottom:8px}.tabs button{min-height:36px;padding:6px 14px;font-size:14px}
+#feed{position:relative;height:340px;overflow-y:auto;overscroll-behavior:contain;-webkit-overflow-scrolling:touch;font-size:15px;line-height:1.35;scroll-behavior:auto}
+#raw{margin:0;height:340px;max-height:none;font-size:13px}
+.grp{margin-top:8px}.grp:first-child{margin-top:0}
+.sec{position:sticky;top:0;z-index:2;display:flex;justify-content:space-between;align-items:baseline;gap:8px;padding:7px 10px;border-radius:8px;background:#2a1f4d;color:#e4d4ff;font-weight:600}
+.sec small{font-weight:400;color:#b6a6dc;font-size:12px;text-align:right}
+.ev{display:flex;gap:10px;padding:5px 6px 5px 10px;border-left:3px solid var(--line);margin:3px 0 3px 6px}
+.ev .t{color:var(--mute);font-size:12px;min-width:34px;padding-top:2px;font-variant-numeric:tabular-nums}
+.ev small{display:block;color:var(--mute);font-size:12.5px}
+.ev.good{border-color:#5eead4}.ev.warn{border-color:#fbbf24}.ev.bad{border-color:var(--bad)}.ev.garbage{border-color:#fb923c}
+.ev.attack{border-color:var(--acc2)}.ev.speed{border-color:#c4b5fd}.ev.move{border-color:var(--acc)}
+.ev.bad>div>b,.ev.garbage>div>b{font-weight:600}
+.ctl{display:flex;gap:6px;margin-top:10px}.ctl button{flex:1;min-height:42px;font-size:14px;padding:8px 4px}
+.ctl button.sel{background:var(--acc);color:#fff}
+.empty{color:var(--mute);padding:16px 6px;font-size:14px}
+
+#dim{position:fixed;inset:0;z-index:60;background:rgba(5,3,12,.84);opacity:0;pointer-events:none;transition:opacity .35s}
+#dim.on{opacity:1;pointer-events:auto}
+#cd{position:fixed;inset:0;width:100%;height:100%;z-index:61;pointer-events:none;display:none}
+#cd.on{display:block}
+#stopPill{position:fixed;left:50%;bottom:calc(30px + env(safe-area-inset-bottom));transform:translateX(-50%);z-index:62;display:none;
+  min-width:150px;height:54px;border-radius:99px;border:2px solid #000;background:linear-gradient(#ff4655,#d71f2f);color:#fff;font-size:20px;font-weight:700;letter-spacing:.03em;
+  box-shadow:0 0 0 4px #000}
+#stopPill.on{display:block}
+</style>
+</head>
+<body>
+<canvas id="bg"></canvas>
+<div id="dim"></div><canvas id="cd"></canvas><button id="stopPill">Abort</button>
+<div id="wait" class="hidden">
+  <div class="wtext"><b>Robot in use</b><p>Someone else is controlling it. Please wait for the previous user to disconnect.</p><p class="hint">This page will open by itself when it is free.</p></div>
+  <div class="wview"><img id="spec" alt="" draggable="false"><div id="specnote" class="hint">Live view of the game</div></div>
+</div>
+<h1>Tetris Robot <span id="state" class="pill">idle</span></h1>
+
+<div class="card">
+  <h2>Live view</h2>
+  <div id="view"><img id="img" alt="camera" draggable="false"><div id="loupe"></div></div>
+  <div class="hint" id="srcnote"></div>
+  <div class="hint" id="calhint">Calibrated. Tap "Re-calibrate" if the camera moved.</div>
+  <div class="row"><button id="calbtn">Calibrate</button><button id="calreset" class="hidden">Undo tap</button></div>
+</div>
+
+<div class="card">
+  <h2>Game</h2>
+  <div class="row"><button data-k="mode" data-v="multiplayer" class="sel">Multiplayer</button><button data-k="mode" data-v="solo">Solo</button></div>
+
+  <div id="boxmulti">
+    <label>Difficulty: <b id="lvlname">3 Normal</b></label>
+    <input id="level" type="range" min="1" max="5" value="3">
+    <div class="row"><button id="ramp" class="sel">Speed ramp: on</button></div>
+    <div class="hint">Ramp on = it gets faster as the game goes on (scales with difficulty). Off = stays at the level's start speed.</div>
+  </div>
+  <div id="boxsolo" class="hidden">
+    <label>Delay between key presses (seconds)</label>
+    <input id="delay" type="number" step="0.01" min="0" value="0.08">
+    <label>Pieces (empty = until Stop)</label>
+    <input id="pieces" type="number" min="1" placeholder="no limit">
+  </div>
+</div>
+
+<button id="go">Start</button>
+<div id="err"></div>
+
+<div class="card" style="margin-top:12px">
+  <h2>Run</h2>
+  <div class="stat"><div><b id="s_pieces">0</b><span>pieces</span></div><div><b id="s_time">0:00</b><span>time</span></div><div><b id="s_delay">-</b><span>delay s</span></div></div>
+  <div class="stat" style="margin-top:8px"><div><b id="s_succ">0/0</b><span>success</span></div><div><b id="s_pct">-</b><span>accuracy</span></div><div><b id="s_miss">0</b><span>missed</span></div></div>
+</div>
+<div class="card">
+  <h2>Activity</h2>
+  <div class="tabs"><button id="tabA" class="sel">Activity</button><button id="tabR">Raw</button></div>
+  <div id="feed"><div class="empty">Nothing yet. Press Start.</div></div>
+  <pre id="raw" class="hidden"></pre>
+  <div class="ctl">
+    <button id="prevSec">&#9650; Prev</button>
+    <button id="nextSec">Next &#9660;</button>
+    <button id="auto" class="sel">Auto: on</button>
+    <button id="latest">Latest &#8595;</button>
+  </div>
+  <div class="hint">Prev / Next jump between pieces. Scrolling up pauses auto-scroll; Latest turns it back on.</div>
+</div>
+
+<script>
+const $=s=>document.querySelector(s);
+// ---- piece colours: the exact RGBs vision.py matches the game with (fetched from the server, with the same values as a fallback)
+let PAL={Z:[171,55,59],L:[174,101,49],O:[174,152,45],S:[133,177,42],J:[82,63,165],T:[159,64,155],I:[72,177,129]};
+const PAL_KEYS=()=>Object.keys(PAL);
+function rgb(c,a,k){k=k||1;return `rgba(${Math.min(255,c[0]*k)|0},${Math.min(255,c[1]*k)|0},${Math.min(255,c[2]*k)|0},${a})`}
+// one TETR.IO-style brick: bright top/left bevel, dark bottom/right bevel, flat face
+function drawBrick(ctx,x,y,s,c,a){
+  const g=Math.max(1,s*.05),w=s-g*2,b=Math.max(2,w*.16);x+=g;y+=g;
+  ctx.globalAlpha=a;ctx.fillStyle=rgb(c,1);ctx.fillRect(x,y,w,w);
+  ctx.fillStyle=rgb(c,1,1.45);ctx.beginPath();ctx.moveTo(x,y);ctx.lineTo(x+w,y);ctx.lineTo(x+w-b,y+b);ctx.lineTo(x+b,y+b);ctx.lineTo(x+b,y+w-b);ctx.lineTo(x,y+w);ctx.fill();   // top + left
+  ctx.fillStyle=rgb(c,1,.55);ctx.beginPath();ctx.moveTo(x+w,y+w);ctx.lineTo(x,y+w);ctx.lineTo(x+b,y+w-b);ctx.lineTo(x+w-b,y+w-b);ctx.lineTo(x+w-b,y+b);ctx.lineTo(x+w,y);ctx.fill();   // bottom + right
+  ctx.fillStyle="rgba(255,255,255,.14)";ctx.fillRect(x+b,y+b,w-b*2,(w-b*2)*.38);                                                       // soft shine
+  ctx.globalAlpha=1;
+}
+let CID; try{CID=localStorage.getItem("tetrisClient")}catch(e){}
+if(!CID){CID=Math.random().toString(36).slice(2)+Date.now().toString(36);try{localStorage.setItem("tetrisClient",CID)}catch(e){}}
+const _fetch=window.fetch.bind(window);
+window.fetch=(u,o={})=>_fetch(u,{...o,headers:{...(o.headers||{}),"X-Client":CID}});
+const STREAM="/stream.mjpg?c="+CID;
+addEventListener("pagehide",()=>navigator.sendBeacon("/api/release?c="+CID));   // tab closed -> free the robot now
+const names=["","Beginner","Easy","Normal","Hard","Insane"];
+const S={mode:"multiplayer",ramp:true,running:false,calibrated:false};
+let taps=null;          // null = not calibrating; else array of [fx,fy]
+const labels=["Tap the TOP-LEFT of the Tetris board","Tap the BOTTOM-RIGHT of the board","Tap the TOP-LEFT of the NEXT queue","Tap the BOTTOM-RIGHT of the NEXT queue"];
+
+document.querySelectorAll("button[data-k]").forEach(b=>b.onclick=()=>{
+  S[b.dataset.k]=b.dataset.v;
+  document.querySelectorAll(`button[data-k=${b.dataset.k}]`).forEach(x=>x.classList.toggle("sel",x===b));
+  $("#boxmulti").classList.toggle("hidden",S.mode!=="multiplayer");
+  $("#boxsolo").classList.toggle("hidden",S.mode!=="solo");
+});
+$("#level").oninput=e=>$("#lvlname").textContent=e.target.value+" "+names[e.target.value];
+$("#ramp").onclick=()=>{S.ramp=!S.ramp;$("#ramp").textContent="Speed ramp: "+(S.ramp?"on":"off");$("#ramp").classList.toggle("sel",S.ramp)};
+
+const ZOOM=4, LOUPE=112;
+let snap=null, dragging=false, cur=null;     // snap = frozen full-size picture used while calibrating
+function drawDots(){
+  document.querySelectorAll(".dot,.rect").forEach(d=>d.remove());
+  const pts=(taps||[]).slice(); if(dragging&&cur)pts.push(cur);
+  pts.forEach((t,i)=>{const d=document.createElement("div");d.className="dot";
+    d.style.left=t[0]*100+"%";d.style.top=t[1]*100+"%";d.style.background=i<2?"#a259ff":"#7cc4ff";$("#view").appendChild(d)});
+  [[0,"#a259ff"],[2,"#7cc4ff"]].forEach(([i,c])=>{if(pts.length>=i+2){const r=document.createElement("div");r.className="rect";
+    const x1=Math.min(pts[i][0],pts[i+1][0]),x2=Math.max(pts[i][0],pts[i+1][0]),y1=Math.min(pts[i][1],pts[i+1][1]),y2=Math.max(pts[i][1],pts[i+1][1]);
+    r.style.cssText+=`left:${x1*100}%;top:${y1*100}%;width:${(x2-x1)*100}%;height:${(y2-y1)*100}%;border-color:${c}`;$("#view").appendChild(r)}});
+}
+function calHint(){
+  if(taps) $("#calhint").textContent=taps.length<4?`${taps.length+1}/4: ${labels[taps.length]}. Press and drag, let go to place.`:"Saving...";
+  else $("#calhint").textContent=S.calibrated?'Calibrated (purple = board, blue = next queue). Tap "Re-calibrate" to redo.':"Not calibrated yet. Tap Calibrate and follow the prompts.";
+  $("#calbtn").textContent=taps?"Cancel":(S.calibrated?"Re-calibrate":"Calibrate");
+  $("#calreset").classList.toggle("hidden",!taps);
+}
+function endCal(){taps=null;dragging=false;cur=null;$("#view").classList.remove("cal");$("#loupe").style.display="none";
+  $("#img").src=STREAM+"&t="+Date.now();snap=null;drawDots();calHint()}
+$("#calbtn").onclick=()=>{
+  if(taps){endCal();return}
+  taps=[];$("#view").classList.add("cal");
+  const u="/api/snapshot.jpg?c="+CID+"&t="+Date.now();                // freeze the picture so it holds still while you aim
+  snap=new Image();snap.onload=()=>{$("#img").src=u};snap.src=u;
+  drawDots();calHint()};
+$("#calreset").onclick=()=>{if(taps){taps.pop();drawDots();calHint()}};
+
+function pos(e){const r=$("#img").getBoundingClientRect();
+  return {fx:Math.min(1,Math.max(0,(e.clientX-r.left)/r.width)),fy:Math.min(1,Math.max(0,(e.clientY-r.top)/r.height)),r};}
+function showLoupe(e){
+  const {fx,fy,r}=pos(e), L=$("#loupe"), v=$("#view").getBoundingClientRect();
+  L.style.display="block";L.classList.toggle("next",taps.length>=2);       // blue for the next-queue corners, purple for the board
+  let lx=e.clientX-v.left-LOUPE-18, ly=e.clientY-v.top-LOUPE-18;      // up and to the left of the finger
+  if(lx<0) lx=e.clientX-v.left+18;                                    // no room on the left: flip to the right
+  if(ly<0) ly=e.clientY-v.top+18;                                     // no room above: flip below
+  L.style.left=lx+"px";L.style.top=ly+"px";
+  const bw=r.width*ZOOM, bh=r.height*ZOOM;
+  L.style.backgroundImage=`url(${$("#img").src})`;L.style.backgroundSize=`${bw}px ${bh}px`;
+  L.style.backgroundPosition=`${LOUPE/2-fx*bw}px ${LOUPE/2-fy*bh}px`;
+  cur=[fx,fy];drawDots();
+}
+const V=$("#view");
+V.addEventListener("pointerdown",e=>{if(!taps||taps.length>=4)return;e.preventDefault();V.setPointerCapture(e.pointerId);dragging=true;showLoupe(e)});
+V.addEventListener("pointermove",e=>{if(dragging){e.preventDefault();showLoupe(e)}});
+const lift=async e=>{
+  if(!dragging)return;dragging=false;$("#loupe").style.display="none";
+  if(cur)taps.push(cur);cur=null;drawDots();calHint();
+  if(taps.length===4){
+    const res=await fetch("/api/calibrate",{method:"POST",headers:{"Content-Type":"application/json"},
+      body:JSON.stringify({board:[...taps[0],...taps[1]],next:[...taps[2],...taps[3]]})});
+    S.calibrated=res.ok;endCal();
+  }};
+V.addEventListener("pointerup",lift);V.addEventListener("pointercancel",e=>{dragging=false;cur=null;$("#loupe").style.display="none";drawDots()});
+V.addEventListener("contextmenu",e=>e.preventDefault());
+
+$("#go").onclick=async()=>{
+  $("#err").textContent="";
+  if(S.running){await fetch("/api/stop",{method:"POST"});return}
+  const body={mode:S.mode,level:+$("#level").value,ramp:S.ramp,delay:+$("#delay").value||0,pieces:+$("#pieces").value||null};
+  const res=await fetch("/api/start",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(body)});
+  const j=await res.json();
+  if(!res.ok)$("#err").textContent=j.error||"could not start";
+  else{clearTimeout(pollT);poll()}                       // pick up the countdown right away
+};
+
+let lastEvent=0, autoScroll=true, curGrp=null;
+const feed=$("#feed");
+const ICON={good:"\u2713",warn:"!",bad:"\u2715",garbage:"\u25a4",attack:"\u2605",speed:"\u00bb",move:"\u2192",info:"\u00b7"};
+function esc(s){return String(s).replace(/[&<>]/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;"}[c]))}
+function renderEvents(evs){
+  if(!evs.length)return;
+  if(!lastEvent)feed.innerHTML="";                          // first data replaces the "nothing yet" note
+  for(const e of evs){
+    if(e.id<=lastEvent)continue;lastEvent=e.id;
+    if(e.section||!curGrp){curGrp=document.createElement("div");curGrp.className="grp";feed.appendChild(curGrp)}
+    if(e.section){const s=document.createElement("div");s.className="sec";
+      s.innerHTML=`<span>${esc(e.text)}</span><small>${esc(e.detail||"")} &middot; ${fmt(e.t)}</small>`;curGrp.appendChild(s);continue}
+    const d=document.createElement("div");d.className="ev "+e.kind;
+    d.innerHTML=`<span class="t">${fmt(e.t)}</span><div><b>${ICON[e.kind]||""} ${esc(e.text)}</b>${e.detail?`<small>${esc(e.detail)}</small>`:""}</div>`;curGrp.appendChild(d);
+  }
+  while(feed.children.length>400)feed.removeChild(feed.firstChild);
+  if(autoScroll)feed.scrollTop=feed.scrollHeight;
+}
+function setAuto(on){autoScroll=on;$("#auto").textContent="Auto: "+(on?"on":"off");$("#auto").classList.toggle("sel",on)}
+$("#auto").onclick=()=>{setAuto(!autoScroll);if(autoScroll)feed.scrollTop=feed.scrollHeight};
+$("#latest").onclick=()=>{setAuto(true);feed.scrollTop=feed.scrollHeight};
+let progScroll=false;
+feed.addEventListener("scroll",()=>{if(progScroll)return;const atEnd=feed.scrollTop+feed.clientHeight>=feed.scrollHeight-24;if(!atEnd&&autoScroll)setAuto(false)});
+function jump(dir){
+  const grps=[...feed.querySelectorAll(".grp")];if(!grps.length)return;
+  setAuto(false);const top=feed.scrollTop, ys=grps.map(g=>g.offsetTop);      // where each piece's group starts inside the feed
+  let target=null;
+  if(dir<0){for(let i=ys.length-1;i>=0;i--)if(ys[i]<top-8){target=ys[i];break}if(target===null)target=0}
+  else{for(let i=0;i<ys.length;i++)if(ys[i]>top+8){target=ys[i];break}if(target===null)target=feed.scrollHeight}
+  feed.scrollTo({top:target,behavior:"smooth"});
+}
+$("#prevSec").onclick=()=>jump(-1);$("#nextSec").onclick=()=>jump(1);
+function tab(raw){$("#feed").classList.toggle("hidden",raw);$("#raw").classList.toggle("hidden",!raw);
+  $("#tabA").classList.toggle("sel",!raw);$("#tabR").classList.toggle("sel",raw);$(".ctl").classList.toggle("hidden",raw);
+  if(raw)$("#raw").scrollTop=$("#raw").scrollHeight}
+$("#tabA").onclick=()=>tab(false);$("#tabR").onclick=()=>tab(true);
+
+function fmt(s){return Math.floor(s/60)+":"+String(s%60).padStart(2,"0")}
+// waiting screen: a small picture of the board + next queue, refreshed ~2x a second (one request at a time, never queued up)
+let specTimer=null;
+function specWatch(on){
+  if(!on){clearInterval(specTimer);specTimer=null;$("#spec").classList.remove("on");return}
+  if(specTimer)return;
+  const img=$("#spec"),note=$("#specnote");let busy=false;
+  img.onload=()=>{busy=false;img.classList.add("on");note.textContent="Live view of the game"};
+  img.onerror=()=>{busy=false;img.classList.remove("on");note.textContent="No game on screen yet"};
+  const tick=()=>{if(busy||document.hidden)return;busy=true;
+    fetch("/api/spectate.jpg?t="+Date.now()).then(r=>r.status===200?r.blob():null).then(b=>{
+      if(b){img.src=URL.createObjectURL(b)}else{busy=false;img.classList.remove("on");note.textContent="No game on screen yet"}}).catch(()=>{busy=false})};
+  tick();specTimer=setInterval(tick,450);
+}
+let pollT;function schedule(ms){clearTimeout(pollT);pollT=setTimeout(poll,ms)}
+async function poll(){
+  try{
+    const j=await (await fetch("/api/status?since="+lastEvent)).json();
+    $("#wait").classList.toggle("hidden",!j.busy);
+    specWatch(!!j.busy);
+    if(j.busy){$("#img").removeAttribute("src");schedule(2000);return}
+    if(!$("#img").getAttribute("src")&&!taps)$("#img").src=STREAM+"&t="+Date.now();
+    S.running=j.running;S.calibrated=j.calibrated;
+    $("#state").textContent=j.running?"running":"idle";$("#state").classList.toggle("on",j.running);
+    $("#go").textContent=j.running?"STOP":"Start";$("#go").classList.toggle("stop",j.running);
+    $("#s_pieces").textContent=j.pieces;$("#s_time").textContent=fmt(j.elapsed);$("#s_delay").textContent=j.delay??"-";
+    $("#s_succ").textContent=(j.landed??0)+"/"+(j.placed??0);$("#s_pct").textContent=j.placed?(100*j.landed/j.placed).toFixed(j.landed===j.placed?0:1)+"%":"-";$("#s_miss").textContent=j.missed??0;
+    renderEvents(j.events||[]);
+    $("#raw").textContent=j.log.join("\n");
+    if(j.error)$("#err").textContent=j.error;else if(j.camera_error)$("#err").textContent="camera: "+j.camera_error;
+    if(!taps)calHint();
+    $("#srcnote").textContent=j.source==="screen"?"Laptop mode: the bot finds the board by itself with measured boxes, so calibrating is only needed with the camera.":"";
+    countdownFromStatus(j);
+  }catch(e){$("#state").textContent="offline"}
+  schedule(cdActive?250:1000);
+}
+fetch("/api/palette").then(r=>r.json()).then(p=>{const ok=Object.values(p).length>=7&&Object.values(p).every(v=>Array.isArray(v)&&v.length===3);if(ok)PAL=p}).catch(()=>{});
+poll();
+
+// ---- start countdown: dim the screen, 5-4-3-2-1 built from bricks in random piece colours, then GO in green
+const FONT={ // 5 wide x 7 tall
+ "5":["#####","#....","####.","....#","....#","#...#",".###."],
+ "4":["...#.","..##.",".#.#.","#..#.","#####","...#.","...#."],
+ "3":[".###.","#...#","....#","..##.","....#","#...#",".###."],
+ "2":[".###.","#...#","....#","...#.","..#..",".#...","#####"],
+ "1":["..#..",".##..","..#..","..#..","..#..","..#..",".###."],
+ "G":[".###.","#...#","#....","#.###","#...#","#...#",".###."],
+ "O":[".###.","#...#","#...#","#...#","#...#","#...#",".###."]};
+const cdc=$("#cd"),cx=cdc.getContext("2d");
+let cdActive=false,cdEnd=0,cdGoUntil=0,cdGlyph="",cdColor=null,cdT0=0,cdDims={},prevPhase="idle",cdRaf=0;
+function randColor(){const k=PAL_KEYS();return PAL[k[Math.floor(Math.random()*k.length)]]}
+function cdShow(on){cdActive=on;$("#dim").classList.toggle("on",on);cdc.classList.toggle("on",on);$("#stopPill").classList.toggle("on",on);
+  document.body.style.overflow=on?"hidden":"";
+  if(on){const d=Math.min(devicePixelRatio||1,2);cdc.width=innerWidth*d;cdc.height=innerHeight*d;cdDims={d};if(!cdRaf)cdRaf=requestAnimationFrame(cdFrame)}}
+function setGlyph(g,color){cdGlyph=g;cdColor=color;cdT0=performance.now()}
+function countdownFromStatus(j){
+  if(j.phase==="countdown"){
+    cdEnd=performance.now()+j.countdown_left*1000;
+    if(!cdActive)cdShow(true);
+  }else if(cdActive){
+    if(prevPhase==="countdown"&&j.phase==="running"&&!cdGoUntil){cdGoUntil=performance.now()+1000;setGlyph("GO",PAL.S)}   // the countdown just ended: GO in green
+    else if(!cdGoUntil)cdShow(false);                                                                                       // stopped or failed to start
+  }
+  prevPhase=j.phase;
+}
+$("#stopPill").onclick=async()=>{cdGoUntil=0;cdShow(false);await fetch("/api/stop",{method:"POST"});clearTimeout(pollT);poll()};
+function glyphCells(g){const rows=g==="GO"?FONT.G.map((r,i)=>r+"."+FONT.O[i]):FONT[g];const out=[];rows.forEach((r,y)=>[...r].forEach((ch,x)=>{if(ch==="#")out.push([x,y])}));return {out,cols:rows[0].length}}
+function cdFrame(t){
+  cdRaf=requestAnimationFrame(cdFrame);
+  if(!cdActive){cancelAnimationFrame(cdRaf);cdRaf=0;return}
+  const now=performance.now();
+  if(cdGoUntil){if(now>cdGoUntil){cdGoUntil=0;cdShow(false);return}}
+  else{const left=Math.max(0,(cdEnd-now)/1000),d=String(Math.max(1,Math.ceil(left)));
+       if(left>0&&d!==cdGlyph)setGlyph(d,randColor());}                 // a new random colour for every number
+  if(!cdGlyph)return;
+  const dpr=cdDims.d||1,W=cdc.width/dpr,H=cdc.height/dpr;cx.setTransform(dpr,0,0,dpr,0,0);cx.clearRect(0,0,W,H);
+  const {out,cols}=glyphCells(cdGlyph),s=Math.min(W*.82/cols,H*.42/7),ox=(W-cols*s)/2,oy=(H-7*s)/2-H*.04;
+  const age=now-cdT0;
+  for(const [x,y] of out){
+    const delay=(6-y)*55+((x*37)%5)*18,p=Math.min(1,Math.max(0,(age-delay)/420)),e=1-Math.pow(1-p,3);   // bricks drop in, bottom rows first
+    if(p<=0)continue;
+    drawBrick(cx,ox+x*s,oy+y*s-(1-e)*H*.55,s,cdColor,Math.min(1,p*2.2));
+  }
+}
+
+// ---- slow falling Tetris pieces in the background (canvas; pauses when the tab is hidden; still image if reduced-motion)
+(function(){
+  const cv=$("#bg"),ctx=cv.getContext("2d");
+  const SHAPES={I:[[0,0],[1,0],[2,0],[3,0]],O:[[0,0],[1,0],[0,1],[1,1]],T:[[0,0],[1,0],[2,0],[1,1]],S:[[1,0],[2,0],[0,1],[1,1]],
+                Z:[[0,0],[1,0],[1,1],[2,1]],J:[[0,0],[0,1],[1,1],[2,1]],L:[[2,0],[0,1],[1,1],[2,1]]};
+  
+  let W=0,H=0,dpr=1,pieces=[];
+  function mk(spawnTop){
+    const keys=Object.keys(SHAPES),cell=16+Math.random()*22;
+    return {cells:SHAPES[keys[Math.floor(Math.random()*keys.length)]],cell,x:Math.random()*W,y:spawnTop?-cell*4-Math.random()*H*.3:Math.random()*H,
+            vy:10+Math.random()*22,rot:Math.random()*Math.PI*2,vr:(Math.random()-.5)*.25,color:randColor(),a:.16+Math.random()*.16};
+  }
+  function size(){dpr=Math.min(window.devicePixelRatio||1,1.5);W=innerWidth;H=innerHeight;cv.width=W*dpr;cv.height=H*dpr;
+    const n=Math.max(10,Math.min(26,Math.round(W*H/26000)));while(pieces.length<n)pieces.push(mk(false));pieces.length=n}
+  function draw(){
+    ctx.setTransform(dpr,0,0,dpr,0,0);ctx.clearRect(0,0,W,H);
+    for(const p of pieces){
+      ctx.save();ctx.translate(p.x,p.y);ctx.rotate(p.rot);
+      for(const [bx,by] of p.cells)drawBrick(ctx,bx*p.cell,by*p.cell,p.cell,p.color,p.a);
+      ctx.restore();
+    }
+  }
+  let last=0;
+  function frame(t){
+    requestAnimationFrame(frame);
+    if(document.hidden||t-last<33)return;                       // ~30 fps is plenty for slow drifting
+    const dt=Math.min(.1,(t-last)/1000||0);last=t;
+    for(const p of pieces){p.y+=p.vy*dt;p.rot+=p.vr*dt;if(p.y>H+p.cell*5){Object.assign(p,mk(true))}}
+    draw();
+  }
+  size();addEventListener("resize",size);draw();
+  if(!matchMedia("(prefers-reduced-motion: reduce)").matches)requestAnimationFrame(frame);
+})();
+</script>
+</body>
+</html>
