@@ -1,0 +1,350 @@
+#!/usr/bin/env python3
+"""
+Python port of Adafruit_PWMServoDriver (PCA9685) for Raspberry Pi 5.
+
+Wiring - choose ONE option and set I2C_BUS (near the bottom) to match:
+
+  CURRENT: GPIO 4 (SDA, physical pin 7) and GPIO 5 (SCL, physical pin 29)
+      = Pi 5 hardware I2C2.  Add to /boot/firmware/config.txt:
+          dtoverlay=i2c2-pi5,pins_4_5
+      Reboot, run `i2cdetect -l` to find the bus number, and set I2C_BUS
+      to it (expected: 2).
+
+  Default (not used right now): GPIO 2 (SDA, pin 3) and GPIO 3 (SCL, pin 5) = I2C bus 1
+      Enable with:  sudo raspi-config -> Interface Options -> I2C -> Enable
+      Then reboot and set I2C_BUS = 1
+
+  Option A: physical header pins 27 (SDA) and 28 (SCL)
+            = GPIO 0 / GPIO 1 = hardware I2C bus 0
+      Add to /boot/firmware/config.txt:   dtparam=i2c_vc=on
+      Reboot, then set I2C_BUS = 0  (confirm with `ls /dev/i2c*`)
+
+  Option B: literal GPIO 27 (SDA) and GPIO 28 (SCL) via software I2C
+      NOTE: GPIO 28 is NOT broken out on the Pi 5's 40-pin header.
+      If you use this option, pick another free GPIO for SCL.
+      Add to /boot/firmware/config.txt:
+          dtoverlay=i2c-gpio,bus=4,i2c_gpio_sda=27,i2c_gpio_scl=28
+      Reboot, then set I2C_BUS = 4
+
+  Either way:
+    PCA9685 VCC -> 3.3V   (logic power)
+    PCA9685 GND -> GND
+    Servo power -> PCA9685 V+ terminal from an EXTERNAL 5-6V supply
+                   (share its ground with the Pi's ground)
+    Servo signal wire -> PCA9685 channel 4
+
+Setup:
+    pip install smbus2   (inside a venv on Raspberry Pi OS Bookworm)
+    Verify the chip is visible:  i2cdetect -y <I2C_BUS>   (look for 40)
+
+Original library: BSD license, (c) Limor Fried/Ladyada, Adafruit Industries.
+"""
+
+import sys
+import termios
+import time
+import tty
+from smbus2 import SMBus
+
+# ---------------------------------------------------------------------------
+# REGISTER ADDRESSES
+# ---------------------------------------------------------------------------
+PCA9685_MODE1 = 0x00
+PCA9685_MODE2 = 0x01
+PCA9685_SUBADR1 = 0x02
+PCA9685_SUBADR2 = 0x03
+PCA9685_SUBADR3 = 0x04
+PCA9685_ALLCALLADR = 0x05
+PCA9685_LED0_ON_L = 0x06
+PCA9685_LED0_ON_H = 0x07
+PCA9685_LED0_OFF_L = 0x08
+PCA9685_LED0_OFF_H = 0x09
+PCA9685_ALLLED_ON_L = 0xFA
+PCA9685_ALLLED_ON_H = 0xFB
+PCA9685_ALLLED_OFF_L = 0xFC
+PCA9685_ALLLED_OFF_H = 0xFD
+PCA9685_PRESCALE = 0xFE
+PCA9685_TESTMODE = 0xFF
+
+# MODE1 bits
+MODE1_ALLCAL = 0x01
+MODE1_SUB3 = 0x02
+MODE1_SUB2 = 0x04
+MODE1_SUB1 = 0x08
+MODE1_SLEEP = 0x10
+MODE1_AI = 0x20       # auto-increment
+MODE1_EXTCLK = 0x40
+MODE1_RESTART = 0x80
+
+# MODE2 bits
+MODE2_OUTNE_0 = 0x01
+MODE2_OUTNE_1 = 0x02
+MODE2_OUTDRV = 0x04   # totem-pole vs open-drain
+MODE2_OCH = 0x08
+MODE2_INVRT = 0x10
+
+PCA9685_I2C_ADDRESS = 0x40
+FREQUENCY_OSCILLATOR = 25_000_000   # internal oscillator, Hz
+
+PCA9685_PRESCALE_MIN = 3
+PCA9685_PRESCALE_MAX = 255
+
+
+class PCA9685:
+    """Port of the Adafruit_PWMServoDriver C++ class."""
+
+    def __init__(self, addr=PCA9685_I2C_ADDRESS, bus=1):
+        self._i2caddr = addr
+        self._bus_num = bus
+        self._bus = None
+        self._oscillator_freq = FREQUENCY_OSCILLATOR
+
+    # -- lifecycle ---------------------------------------------------------
+    def begin(self, prescale=0):
+        """Open the I2C bus and initialise the chip. Returns True on success."""
+        self._bus = SMBus(self._bus_num)
+        try:
+            self._read8(PCA9685_MODE1)          # is anything answering?
+        except OSError:
+            return False
+        self.reset()
+        self.set_oscillator_frequency(FREQUENCY_OSCILLATOR)
+        if prescale:
+            self.set_ext_clk(prescale)
+        else:
+            self.set_pwm_freq(1000)             # default, same as the C++ lib
+        return True
+
+    def close(self):
+        if self._bus is not None:
+            self._bus.close()
+            self._bus = None
+
+    def __enter__(self):
+        if not self.begin():
+            raise RuntimeError("PCA9685 not found - check wiring / I2C enabled")
+        return self
+
+    def __exit__(self, *exc):
+        self.close()
+
+    # -- chip control ------------------------------------------------------
+    def reset(self):
+        self._write8(PCA9685_MODE1, MODE1_RESTART)
+        time.sleep(0.010)
+
+    def sleep(self):
+        awake = self._read8(PCA9685_MODE1)
+        self._write8(PCA9685_MODE1, awake | MODE1_SLEEP)
+        time.sleep(0.005)
+
+    def wakeup(self):
+        asleep = self._read8(PCA9685_MODE1)
+        self._write8(PCA9685_MODE1, asleep & ~MODE1_SLEEP & 0xFF)
+
+    def set_ext_clk(self, prescale):
+        oldmode = self._read8(PCA9685_MODE1)
+        newmode = (oldmode & ~MODE1_RESTART & 0xFF) | MODE1_SLEEP
+        self._write8(PCA9685_MODE1, newmode)
+        newmode |= MODE1_EXTCLK
+        self._write8(PCA9685_MODE1, newmode)
+        self._write8(PCA9685_PRESCALE, prescale)
+        time.sleep(0.005)
+        self._write8(PCA9685_MODE1,
+                     (newmode & ~MODE1_SLEEP & 0xFF) | MODE1_RESTART | MODE1_AI)
+
+    def set_pwm_freq(self, freq):
+        """Set PWM frequency (Hz) for the whole chip. Servos want ~50 Hz."""
+        freq = max(1, min(freq, 3500))
+        prescaleval = (self._oscillator_freq / (freq * 4096.0)) + 0.5 - 1
+        prescaleval = max(PCA9685_PRESCALE_MIN,
+                          min(prescaleval, PCA9685_PRESCALE_MAX))
+        prescale = int(prescaleval)
+
+        oldmode = self._read8(PCA9685_MODE1)
+        newmode = (oldmode & ~MODE1_RESTART & 0xFF) | MODE1_SLEEP
+        self._write8(PCA9685_MODE1, newmode)             # go to sleep
+        self._write8(PCA9685_PRESCALE, prescale)         # set prescaler
+        self._write8(PCA9685_MODE1, oldmode)             # wake
+        time.sleep(0.005)
+        self._write8(PCA9685_MODE1, oldmode | MODE1_RESTART | MODE1_AI)
+
+    def set_output_mode(self, totempole):
+        oldmode = self._read8(PCA9685_MODE2)
+        if totempole:
+            newmode = oldmode | MODE2_OUTDRV
+        else:
+            newmode = oldmode & ~MODE2_OUTDRV & 0xFF
+        self._write8(PCA9685_MODE2, newmode)
+
+    def read_prescale(self):
+        return self._read8(PCA9685_PRESCALE)
+
+    # -- PWM output --------------------------------------------------------
+    def get_pwm(self, num, off=False):
+        reg = PCA9685_LED0_ON_L + 4 * num + (2 if off else 0)
+        low = self._read8(reg)
+        high = self._read8(reg + 1)
+        return low | (high << 8)
+
+    def set_pwm(self, num, on, off):
+        """Turn channel `num` ON at tick `on` and OFF at tick `off` (of 4096)."""
+        reg = PCA9685_LED0_ON_L + 4 * num
+        data = [on & 0xFF, (on >> 8) & 0xFF, off & 0xFF, (off >> 8) & 0xFF]
+        try:
+            self._bus.write_i2c_block_data(self._i2caddr, reg, data)
+            return 0
+        except OSError:
+            return 1
+
+    def set_pin(self, num, val, invert=False):
+        """Set duty cycle 0-4095 with correct handling of fully on / fully off."""
+        val = min(val, 4095)
+        if invert:
+            if val == 0:
+                self.set_pwm(num, 4096, 0)       # fully on
+            elif val == 4095:
+                self.set_pwm(num, 0, 4096)       # fully off
+            else:
+                self.set_pwm(num, 0, 4095 - val)
+        else:
+            if val == 4095:
+                self.set_pwm(num, 4096, 0)       # fully on
+            elif val == 0:
+                self.set_pwm(num, 0, 4096)       # fully off
+            else:
+                self.set_pwm(num, 0, val)
+
+    def write_microseconds(self, num, microseconds):
+        """Set pulse width in microseconds (what servos actually care about)."""
+        prescale = self.read_prescale() + 1
+        us_per_tick = 1_000_000 * prescale / self._oscillator_freq
+        ticks = int(round(microseconds / us_per_tick))
+        self.set_pwm(num, 0, ticks)
+
+    # -- oscillator calibration -------------------------------------------
+    def get_oscillator_frequency(self):
+        return self._oscillator_freq
+
+    def set_oscillator_frequency(self, freq):
+        self._oscillator_freq = freq
+
+    # -- low-level I2C -----------------------------------------------------
+    def _read8(self, reg):
+        return self._bus.read_byte_data(self._i2caddr, reg)
+
+    def _write8(self, reg, value):
+        self._bus.write_byte_data(self._i2caddr, reg, value & 0xFF)
+
+
+# ---------------------------------------------------------------------------
+# Continuous-rotation (360 degree) servo helper
+# ---------------------------------------------------------------------------
+class ContinuousServo:
+    """
+    A 360-degree servo does not hold an angle. The pulse width sets SPEED:
+        ~1500 us = stopped
+        < 1500 us = spin one way (faster the further from 1500)
+        > 1500 us = spin the other way
+    speed is a number from -1.0 to +1.0; 0 = stop.
+    Pulses stay inside 1000-2000 us, the range these servos actually accept
+    (the old angle code sent 500-2500 us, which many continuous servos ignore).
+    """
+
+    def __init__(self, pca, channel, stop_us=1500, range_us=500):
+        self.pca = pca
+        self.channel = channel
+        self.stop_us = stop_us      # tweak this if the servo creeps when "stopped"
+        self.range_us = range_us    # 500 -> pulses from 1000 to 2000 us
+
+    def set_speed(self, speed):
+        speed = max(-1.0, min(1.0, speed))
+        self.pca.write_microseconds(self.channel,
+                                    self.stop_us + speed * self.range_us)
+
+    def stop(self):
+        self.set_speed(0)
+
+    def release(self):
+        """Stop sending pulses entirely (servo is fully idle)."""
+        self.pca.set_pwm(self.channel, 0, 4096)
+
+
+# ---------------------------------------------------------------------------
+# Demo: press 'k' to spin forward, spin back the same amount, then stop
+# ---------------------------------------------------------------------------
+I2C_BUS = 2            # 2 = GPIO 4 (SDA) / GPIO 5 (SCL) via dtoverlay=i2c2-pi5,pins_4_5
+                       # (confirm the number with `i2cdetect -l`; 1 = GPIO 2/3, the default bus)
+SERVO_CHANNEL = 4      # the PCA9685 channel your servo is plugged into
+SERVO_FREQ = 50        # Hz, standard for hobby servos
+
+TRIGGER_KEY = "k"      # press this to start a sweep
+QUIT_KEY = "q"         # press this to exit the program
+
+SPEED = 1        # 0.1 to 1.0 (try 1.0 if it does not move at all)
+SPIN_SECONDS = 0.4     # how long each direction lasts (the "sweep" size)
+STOP_US = 1500         # pulse that makes YOUR servo stop (try 1450-1550 if it creeps)
+PAUSE = 0            # short pause between directions
+
+"""
+def sweep_once(servo):
+
+ Spin one way, spin back the same amount of time, then stop.
+    servo.set_speed(SPEED)           # forward
+    time.sleep(SPIN_SECONDS)
+    servo.stop()
+    time.sleep(PAUSE)
+
+    servo.set_speed(-SPEED)          # return
+    time.sleep(SPIN_SECONDS)
+    servo.stop()
+    time.sleep(PAUSE)
+
+    servo.release()                  # stop sending pulses
+"""
+
+
+def sweep_once(servo):
+    #Spin one way, then straight back the other way, then stop.
+    servo.set_speed(SPEED)           # forward
+    time.sleep(SPIN_SECONDS)
+
+    servo.set_speed(-SPEED)          # return immediately
+    time.sleep(SPIN_SECONDS)
+
+    servo.stop()
+    servo.release()                  # stop sending pulses
+if __name__ == "__main__":
+    if not sys.stdin.isatty():
+        raise SystemExit("Run this from a real terminal so key presses can be read.")
+
+    fd = sys.stdin.fileno()
+    old_term_settings = termios.tcgetattr(fd)
+
+    with PCA9685(addr=0x40, bus=I2C_BUS) as pca:
+        pca.set_pwm_freq(SERVO_FREQ)
+        servo = ContinuousServo(pca, SERVO_CHANNEL, stop_us=STOP_US)
+        servo.release()              # make sure it is idle at start
+
+        print(f"Press '{TRIGGER_KEY}' to sweep once, '{QUIT_KEY}' to quit (Ctrl+C also works).")
+
+        try:
+            tty.setcbreak(fd)        # read single key presses, no Enter needed
+            while True:
+                key = sys.stdin.read(1)
+                if key == TRIGGER_KEY:
+                    print("Sweeping...")
+                    sweep_once(servo)
+                    termios.tcflush(fd, termios.TCIFLUSH)   # ignore keys pressed mid-sweep
+                    print("Done. Press 'k' again.")
+                elif key == QUIT_KEY:
+                    break
+        except KeyboardInterrupt:
+            pass
+        finally:
+            termios.tcsetattr(fd, termios.TCSADRAIN, old_term_settings)
+            servo.stop()
+            time.sleep(0.2)
+            servo.release()
+            print("Stopped.")
+
